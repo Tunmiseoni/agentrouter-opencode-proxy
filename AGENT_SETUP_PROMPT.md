@@ -28,7 +28,7 @@ If the directory already exists, run `git -C ~/.config/opencode/agentrouter-prox
 ```bash
 cd ~/.config/opencode/agentrouter-proxy
 python3 -m venv .venv
-.venv/bin/pip install -q fastapi "uvicorn[standard]" httpx anthropic
+.venv/bin/pip install -q fastapi "uvicorn[standard]" "httpx<1" "anthropic<1"
 ```
 Confirm all four packages installed without errors.
 

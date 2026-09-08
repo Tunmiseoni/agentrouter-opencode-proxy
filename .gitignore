@@ -1,5 +1,7 @@
 .venv/
+.tray/
 __pycache__/
 *.pyc
 *.pyo
 .env
+.DS_Store

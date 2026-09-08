@@ -8,7 +8,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ ! -d "$DIR/.venv" ]; then
     echo "Creating virtualenv..."
     python3 -m venv "$DIR/.venv"
-    "$DIR/.venv/bin/pip" install -q fastapi "uvicorn[standard]" httpx anthropic
+    "$DIR/.venv/bin/pip" install -q fastapi "uvicorn[standard]" "httpx<1" "anthropic<1"
 fi
 
 exec "$DIR/.venv/bin/python" "$DIR/proxy.py"

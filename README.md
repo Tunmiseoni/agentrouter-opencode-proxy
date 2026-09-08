@@ -193,7 +193,7 @@ cd agentrouter-opencode-proxy
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install fastapi "uvicorn[standard]" httpx anthropic
+.venv/bin/pip install fastapi "uvicorn[standard]" "httpx<1" "anthropic<1"
 ```
 
 ### 3. Store your API key
