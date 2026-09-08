@@ -1,0 +1,336 @@
+#!/bin/zsh
+
+SCRIPT_PATH="${0:A}"
+PROXY_DIR="${SCRIPT_PATH:h:h}"
+START_SCRIPT="$PROXY_DIR/start.sh"
+PID_FILE="/tmp/agentrouter-opencode-proxy.pid"
+LOG_FILE="/tmp/agentrouter-opencode-proxy.log"
+TRAY_PID_FILE="/tmp/agentrouter-opencode-proxy-tray.pid"
+TRAY_SRC="$PROXY_DIR/tray.swift"
+TRAY_BIN="$PROXY_DIR/.tray/agentrouter-tray"
+
+KEY_DIR="$HOME/.config/opencode/api_keys"
+QUOTA_USER_ID_FILE="$KEY_DIR/AGENT_ROUTER_USER_ID"
+QUOTA_COOKIE_FILE="$KEY_DIR/AGENT_ROUTER_COOKIE"
+
+TRAY_INTERVAL="${AGENTROUTER_TRAY_INTERVAL:-120}"
+
+is_running() {
+    [[ -f "$PID_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null)
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+tray_is_running() {
+    [[ -f "$TRAY_PID_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$TRAY_PID_FILE" 2>/dev/null)
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+ensure_tray_built() {
+    if [[ -x "$TRAY_BIN" ]] && [[ "$TRAY_SRC" -ot "$TRAY_BIN" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "$TRAY_SRC" ]]; then
+        echo "tray.swift not found at $TRAY_SRC"
+        return 1
+    fi
+
+    mkdir -p "$(dirname "$TRAY_BIN")"
+    swiftc -O "$TRAY_SRC" -o "$TRAY_BIN" -framework Cocoa 2>/dev/null
+
+    if [[ ! -x "$TRAY_BIN" ]]; then
+        echo "Failed to compile tray app"
+        return 1
+    fi
+}
+
+start_tray() {
+    if tray_is_running; then
+        return 0
+    fi
+
+    ensure_tray_built || return 1
+
+    AGENTROUTER_PROXY="$SCRIPT_PATH" \
+    AGENTROUTER_TRAY_INTERVAL="$TRAY_INTERVAL" \
+        nohup "$TRAY_BIN" > /dev/null 2>&1 &
+    echo $! > "$TRAY_PID_FILE"
+
+    sleep 0.5
+    if ! tray_is_running; then
+        rm -f "$TRAY_PID_FILE"
+        return 1
+    fi
+}
+
+stop_tray() {
+    if ! tray_is_running; then
+        rm -f "$TRAY_PID_FILE"
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$TRAY_PID_FILE")
+    kill "$pid" 2>/dev/null
+
+    for _ in {1..20}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null
+    fi
+
+    rm -f "$TRAY_PID_FILE"
+}
+
+fetch_quota() {
+    local user_id="" cookie=""
+    if [[ -f "$QUOTA_USER_ID_FILE" ]]; then
+        user_id=$(cat "$QUOTA_USER_ID_FILE" 2>/dev/null | tr -d '\n')
+    fi
+    if [[ -f "$QUOTA_COOKIE_FILE" ]]; then
+        cookie=$(cat "$QUOTA_COOKIE_FILE" 2>/dev/null | tr -d '\n')
+    fi
+
+    if [[ -z "$user_id" || -z "$cookie" ]]; then
+        echo '{"error":"missing credentials","hint":"run: agentrouter-proxy set-cookie"}'
+        return 1
+    fi
+
+    curl -s --max-time 5 \
+        'https://agentrouter.org/api/user/self' \
+        -H "New-API-User: $user_id" \
+        -b "$cookie" 2>/dev/null
+}
+
+quota_report() {
+    local raw=false
+    [[ "$1" == "--raw" ]] && raw=true
+
+    local resp
+    resp=$(fetch_quota) || {
+        if $raw; then
+            echo '{"error":"failed to fetch quota"}'
+        else
+            echo "Failed to fetch quota — check your cookie/credentials."
+            echo "  agentrouter-proxy set-cookie"
+        fi
+        return 1
+    }
+
+    local ok
+    ok=$(echo "$resp" | jq -r '.success' 2>/dev/null)
+    if [[ "$ok" != "true" ]]; then
+        if $raw; then
+            echo "$resp"
+        else
+            echo "Quota API returned an error:"
+            echo "$resp" | jq '.' 2>/dev/null || echo "$resp"
+            echo ""
+            echo "Your session cookie may have expired. Refresh with:"
+            echo "  agentrouter-proxy set-cookie"
+        fi
+        return 1
+    fi
+
+    if $raw; then
+        echo "$resp" | jq '.data | {quota, used_quota, request_count, id, username}' 2>/dev/null
+    else
+        local quota used total pct dollars used_dollars total_dollars reqs
+        quota=$(echo "$resp" | jq '.data.quota' 2>/dev/null)
+        used=$(echo "$resp" | jq '.data.used_quota' 2>/dev/null)
+        reqs=$(echo "$resp" | jq '.data.request_count' 2>/dev/null)
+        total=$((quota + used))
+        if (( total > 0 )); then
+            pct=$(awk "BEGIN{printf \"%.1f\", $quota/$total*100}")
+            dollars=$(awk "BEGIN{printf \"%.2f\", $quota/500000}")
+            used_dollars=$(awk "BEGIN{printf \"%.2f\", $used/500000}")
+            total_dollars=$(awk "BEGIN{printf \"%.2f\", $total/500000}")
+        else
+            pct="0.0"
+            dollars="0.00"
+            used_dollars="0.00"
+            total_dollars="0.00"
+        fi
+        echo "Quota remaining: ${pct}% (\$${dollars} of \$${total_dollars} used)"
+        echo "  Used: \$${used_dollars}  Requests: ${reqs}"
+    fi
+}
+
+set_cookie() {
+    local user_id="" cookie=""
+
+    if [[ -f "$QUOTA_USER_ID_FILE" ]]; then
+        user_id=$(cat "$QUOTA_USER_ID_FILE" 2>/dev/null | tr -d '\n')
+    fi
+
+    echo "Paste your New-API-User id (current: ${user_id:-none}):"
+    read -r new_id
+    if [[ -n "$new_id" ]]; then
+        echo "$new_id" > "$QUOTA_USER_ID_FILE"
+        chmod 600 "$QUOTA_USER_ID_FILE"
+        user_id="$new_id"
+        echo "Saved user id."
+    fi
+
+    echo "Paste your session cookie (current: ${cookie:+set}):"
+    read -r new_cookie
+    if [[ -n "$new_cookie" ]]; then
+        echo "$new_cookie" > "$QUOTA_COOKIE_FILE"
+        chmod 600 "$QUOTA_COOKIE_FILE"
+        cookie="$new_cookie"
+        echo "Saved cookie."
+    fi
+
+    if [[ -n "$user_id" && -n "$cookie" ]]; then
+        echo ""
+        echo "Testing..."
+        quota_report
+    else
+        echo "Both user id and cookie are needed."
+        return 1
+    fi
+}
+
+start_proxy() {
+    if is_running; then
+        echo "AgentRouter proxy is already running (PID $(cat "$PID_FILE"))."
+        echo "URL: http://localhost:7187"
+        return 0
+    fi
+
+    cd "$PROXY_DIR" || exit 1
+
+    if [[ "$1" == "-d" || "$1" == "--background" ]]; then
+        nohup "$START_SCRIPT" > "$LOG_FILE" 2>&1 &
+        local pid=$!
+        echo "$pid" > "$PID_FILE"
+
+        sleep 1
+
+        if is_running; then
+            echo "AgentRouter proxy started in background."
+            echo "PID: $pid"
+            echo "URL: http://localhost:7187"
+            echo "Log: $LOG_FILE"
+            echo ""
+            quota_report
+            start_tray && echo "Tray icon active in menu bar."
+        else
+            rm -f "$PID_FILE"
+            echo "Failed to start AgentRouter proxy."
+            echo "Check: $LOG_FILE"
+            return 1
+        fi
+    else
+        echo "Starting AgentRouter proxy..."
+        echo "Press Ctrl+C to stop."
+        quota_report
+        start_tray && echo "Tray icon active in menu bar."
+        trap 'stop_tray; echo ""; echo "Stopped."' EXIT INT TERM
+        "$START_SCRIPT"
+    fi
+}
+
+stop_proxy() {
+    local had_tray=false
+    tray_is_running && had_tray=true
+
+    if ! is_running; then
+        echo "AgentRouter proxy is not running."
+        rm -f "$PID_FILE"
+        $had_tray && stop_tray
+        return 0
+    fi
+
+    local pid
+    pid=$(cat "$PID_FILE")
+
+    kill "$pid" 2>/dev/null
+
+    for _ in {1..20}; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            break
+        fi
+        sleep 0.1
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Proxy did not stop cleanly; sending SIGKILL..."
+        kill -9 "$pid" 2>/dev/null
+    fi
+
+    rm -f "$PID_FILE"
+    echo "AgentRouter proxy stopped."
+    $had_tray && stop_tray
+}
+
+status_proxy() {
+    if is_running; then
+        local pid
+        pid=$(cat "$PID_FILE")
+        echo "AgentRouter proxy: RUNNING"
+        echo "PID: $pid"
+        echo "URL: http://localhost:7187"
+        echo "Log: $LOG_FILE"
+        echo ""
+        quota_report
+        if tray_is_running; then
+            echo "Tray icon: active (PID $(cat "$TRAY_PID_FILE"))"
+        else
+            echo "Tray icon: not running"
+        fi
+    else
+        rm -f "$PID_FILE"
+        echo "AgentRouter proxy: STOPPED"
+        if tray_is_running; then
+            echo "Tray icon: active (orphaned, stopping)"
+            stop_tray
+        fi
+    fi
+}
+
+case "${1:-}" in
+    start)
+        start_proxy "$2"
+        ;;
+    stop)
+        stop_proxy
+        ;;
+    status)
+        status_proxy
+        ;;
+    restart)
+        stop_proxy
+        start_proxy "$2"
+        ;;
+    quota)
+        quota_report "$2"
+        ;;
+    set-cookie)
+        set_cookie
+        ;;
+    tray-compile)
+        ensure_tray_built && echo "Tray binary ready: $TRAY_BIN"
+        ;;
+    *)
+        echo "Usage:"
+        echo "  agentrouter-proxy start           Start in foreground"
+        echo "  agentrouter-proxy start -d        Start in background"
+        echo "  agentrouter-proxy stop            Stop the proxy"
+        echo "  agentrouter-proxy status          Check whether it's running"
+        echo "  agentrouter-proxy restart [-d]    Restart the proxy"
+        echo "  agentrouter-proxy quota           Show remaining quota %"
+        echo "  agentrouter-proxy set-cookie      Set/refresh quota credentials"
+        echo "  agentrouter-proxy tray-compile    Pre-compile tray app"
+        exit 1
+        ;;
+esac
