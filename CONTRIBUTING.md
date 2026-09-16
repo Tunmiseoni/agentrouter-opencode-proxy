@@ -19,7 +19,7 @@ AgentRouter's Aliyun WAF has been updated before — the async/sync distinction 
 ### Proxy improvements
 The proxy (`proxy.py`) is intentionally small. Known improvement areas:
 - **Request timeout** — if agentrouter.org hangs, the proxy thread blocks indefinitely. A per-request timeout with clean error response would help.
-- **Model list** — `/v1/models` currently returns a hardcoded stub because the real endpoint is WAF-blocked. A periodic background probe using the sync SDK could keep this fresh.
+- **Model list** — `/v1/models` fetches the live list from the dashboard API (`/api/user/models`) using the `set-cookie` credentials, with a 300s TTL cache and a stub fallback. The dashboard API is *not* WAF-blocked (only the `/messages` LLM path is).
 - **Additional SSE event filtering** — if AgentRouter injects new non-standard event types that break clients, they should be added to `SKIP_EVENTS` in `_stream_worker`.
 - **Windows support** — `start.sh` is bash only. A `start.bat` or `start.ps1` would help Windows users.
 

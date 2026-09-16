@@ -34,6 +34,12 @@ Usage:
     python proxy.py           # reads key from ~/.config/opencode/api_keys/AGENT_ROUTER_API_KEY
     AGENTROUTER_API_KEY=sk-... python proxy.py
 
+The live model list is fetched from the AgentRouter dashboard API using
+the session cookie + New-API-User id written by
+`agentrouter-proxy set-cookie` (~/.config/opencode/api_keys/AGENT_ROUTER_COOKIE
+and AGENT_ROUTER_USER_ID), overridable via AGENTROUTER_COOKIE and
+AGENTROUTER_USER_ID. On failure the last good list, then a stub, is served.
+
 Env knobs (all optional):
     PORT                 local listen port (default 7187)
     LOG_LEVEL            DEBUG|INFO|WARNING|ERROR (default INFO)
@@ -46,6 +52,9 @@ Env knobs (all optional):
     POOL_TIMEOUT         httpx pool timeout seconds (default 5)
     KEEPALIVE_EXPIRY     httpx keepalive expiry seconds (default 20)
     UPSTREAM_MAX_RETRIES Anthropic SDK max retries for initial send (default 2)
+    MODELS_CACHE_TTL     seconds to cache the live model list (default 300)
+    MODELS_TIMEOUT       dashboard model API timeout seconds (default 30;
+                         cold WAF handshakes are slow, ~11s observed)
 """
 
 import asyncio
@@ -77,7 +86,19 @@ warnings.filterwarnings("ignore", message=".*iscoroutinefunction.*")
 
 TARGET = "https://agentrouter.org"
 PORT = int(os.environ.get("PORT", "7187"))
-KEY_FILE = Path.home() / ".config/opencode/api_keys/AGENT_ROUTER_API_KEY"
+KEY_DIR = Path.home() / ".config/opencode/api_keys"
+KEY_FILE = KEY_DIR / "AGENT_ROUTER_API_KEY"
+# Dashboard credentials for the /api/user/* endpoints (model list, quota).
+# Written by `agentrouter-proxy set-cookie`; the same files the CLI's
+# quota command uses. Kept distinct from the sk- API key.
+COOKIE_FILE = KEY_DIR / "AGENT_ROUTER_COOKIE"
+USER_ID_FILE = KEY_DIR / "AGENT_ROUTER_USER_ID"
+# Seconds to cache the upstream model list before re-fetching.
+MODELS_CACHE_TTL = float(os.environ.get("MODELS_CACHE_TTL", "300"))
+# Dashboard cold handshakes are slow through the WAF (~11s observed);
+# keep this generous. The models route runs in a thread, so a slow
+# first fetch never blocks the event loop.
+MODELS_TIMEOUT = float(os.environ.get("MODELS_TIMEOUT", "30"))
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
@@ -222,6 +243,101 @@ def _client() -> anthropic.Anthropic:
             max_retries=UPSTREAM_MAX_RETRIES,
         )
     return _anthropic_client
+
+
+# ── Model list (dashboard API) ─────────────────────────────────────────────────
+
+# Fallback served when the live list is unavailable and nothing is cached.
+# Keep in sync manually; the live source is the dashboard API below.
+_STUB_MODELS = [
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "gpt-5.6-sol",
+    "deepseek-v4-flash",
+    "gpt-6-astra",
+]
+
+# Last successful live list + when it was fetched (monotonic seconds).
+_models_cache: dict = {"data": None, "at": 0.0}
+
+
+def _dashboard_credentials() -> tuple[str, str]:
+    """Return (user_id, cookie) for the dashboard API.
+
+    Env vars win so the proxy can run without the CLI's files; otherwise
+    reuse the files written by `agentrouter-proxy set-cookie`. Read fresh
+    each call so a cookie refresh needs no proxy restart.
+    """
+    user_id = os.environ.get("AGENTROUTER_USER_ID", "").strip()
+    cookie = os.environ.get("AGENTROUTER_COOKIE", "").strip()
+    if not user_id and USER_ID_FILE.exists():
+        user_id = USER_ID_FILE.read_text().strip()
+    if not cookie and COOKIE_FILE.exists():
+        cookie = COOKIE_FILE.read_text().strip()
+    return user_id, cookie
+
+
+def _fetch_models() -> list[str]:
+    """Fetch the live model ids from the dashboard API.
+
+    The dashboard endpoints aren't behind the WAF's TLS/SDK fingerprint
+    check (only the /messages LLM path is), so plain httpx works here.
+    Raises on missing credentials or a non-success upstream response.
+    """
+    user_id, cookie = _dashboard_credentials()
+    if not user_id or not cookie:
+        raise RuntimeError(
+            "no dashboard credentials; run: agentrouter-proxy set-cookie"
+        )
+
+    resp = _HTTP_CLIENT.get(
+        f"{TARGET}/api/user/models",
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "New-API-User": user_id,
+            "Cookie": cookie,
+            "Referer": "https://agentrouter.org/console/token",
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/152.0.0.0 Safari/537.36"
+            ),
+        },
+        timeout=MODELS_TIMEOUT,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    if not payload.get("success", False):
+        raise RuntimeError(f"upstream model API error: {str(payload)[:200]}")
+
+    data = payload.get("data") or []
+    models = [m for m in data if isinstance(m, str) and m]
+    if not models:
+        raise RuntimeError("upstream model API returned an empty list")
+    return models
+
+
+def _models() -> list[str]:
+    """Live model list with a TTL cache and stub fallback."""
+    now = time.monotonic()
+    cached = _models_cache["data"]
+    if cached is not None and now - _models_cache["at"] < MODELS_CACHE_TTL:
+        return cached
+
+    try:
+        models = _fetch_models()
+    except Exception as exc:
+        if cached is not None:
+            log.warning("models fetch failed (%s); serving last-good cache", exc)
+            # Serve stale rather than fail; retry on the next TTL window.
+            _models_cache["at"] = now
+            return cached
+        log.warning("models fetch failed (%s); serving stub list", exc)
+        return _STUB_MODELS
+
+    _models_cache["data"] = models
+    _models_cache["at"] = now
+    return models
 
 
 # ── Request translation ───────────────────────────────────────────────────────
@@ -559,16 +675,11 @@ async def messages(request: Request):
 @app.get("/v1/models")
 @app.get("/models")
 async def models():
-    """Stub model list — only lists models confirmed working on agentrouter.org."""
+    """Live model list from the AgentRouter dashboard API (TTL-cached)."""
+    ids = await asyncio.to_thread(_models)
     return {
         "object": "list",
-        "data": [
-            {"id": "claude-opus-5", "object": "model"},
-            {"id": "claude-opus-4-8", "object": "model"},
-            {"id": "gpt-5.6-sol", "object": "model"},
-            {"id": "deepseek-v4-flash", "object": "model"},
-            {"id": "glm-5.3", "object": "model"},
-        ],
+        "data": [{"id": mid, "object": "model"} for mid in ids],
     }
 
 

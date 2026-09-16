@@ -168,7 +168,7 @@ This is the exact architecture of `proxy.py` in this repo.
 | AgentRouter injects `billing_summary` SSE events | Proxy filters them — OpenCode's Zod parser rejects unknown event types |
 | OpenCode sends `thinking: {type: adaptive}` and `output_config` fields | Proxy strips these — AgentRouter's content filter blocks requests containing them |
 | OpenCode AI SDK calls `/messages` (no `/v1` prefix) | Proxy mounts on both `/messages` and `/v1/messages` |
-| `GET /v1/models` is also WAF-blocked | Proxy returns a local stub model list instead |
+| `GET /v1/models` (LLM path) is WAF-blocked | Proxy fetches the list from the dashboard API (`/api/user/models`) using your `set-cookie` credentials, cached for 5 min |
 
 ---
 
