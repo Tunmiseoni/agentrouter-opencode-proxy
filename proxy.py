@@ -30,6 +30,18 @@ Long-request hardening (grill sessions can stream for many minutes):
 - Downstream disconnects propagate: the worker is signalled and the
   upstream response is closed instead of leaking a thread.
 
+Thinking history:
+- AgentRouter runs reasoning models in "thinking mode": every assistant
+  message containing a `tool_use` block must also carry a `thinking`
+  block, or upstream rejects the request with "The `content[].thinking`
+  in the thinking mode must be passed back to the API."
+- @ai-sdk/anthropic drops reasoning parts lacking a provider signature,
+  so unsigned tool-use turns arrive without their thinking block and trip
+  that check. AgentRouter also cannot deserialize `redacted_thinking`.
+- The proxy therefore drops `redacted_thinking` and injects a minimal
+  empty `thinking` block into tool-use turns that lack one (THINKING_HISTORY,
+  default `ensure`).
+
 Usage:
     python proxy.py           # reads key from ~/.config/opencode/api_keys/AGENT_ROUTER_API_KEY
     AGENTROUTER_API_KEY=sk-... python proxy.py
@@ -55,6 +67,9 @@ Env knobs (all optional):
     MODELS_CACHE_TTL     seconds to cache the live model list (default 300)
     MODELS_TIMEOUT       dashboard model API timeout seconds (default 30;
                          cold WAF handshakes are slow, ~11s observed)
+    THINKING_HISTORY     how to handle prior thinking blocks in request
+                         history: ensure | strip | off (default ensure).
+                         See "Thinking history" below.
 """
 
 import asyncio
@@ -122,6 +137,27 @@ WRITE_TIMEOUT = float(os.environ.get("WRITE_TIMEOUT", "60"))
 POOL_TIMEOUT = float(os.environ.get("POOL_TIMEOUT", "5"))
 KEEPALIVE_EXPIRY = float(os.environ.get("KEEPALIVE_EXPIRY", "20"))
 UPSTREAM_MAX_RETRIES = int(os.environ.get("UPSTREAM_MAX_RETRIES", "2"))
+
+# How to treat thinking/redacted_thinking content blocks in the request
+# history before forwarding upstream.
+#
+# AgentRouter runs reasoning models (e.g. deepseek-v4-flash) in "thinking
+# mode", where it requires every assistant message that contains a `tool_use`
+# block to also carry a `thinking` block — otherwise it returns:
+#   "The `content[].thinking` in the thinking mode must be passed back to the API."
+# (Verified empirically: a tool_use turn without thinking 400s; text-only
+# assistant turns do not need thinking. See README "Thinking history".)
+#
+# @ai-sdk/anthropic silently drops reasoning parts that have no provider
+# `signature`, so unsigned tool-use turns arrive without their thinking block
+# and trip that check. AgentRouter also cannot deserialize `redacted_thinking`
+# (unknown variant), so those must never be forwarded.
+#
+#   ensure (default) drop redacted_thinking; inject an empty thinking block
+#                    into tool_use turns that lack one; keep existing thinking
+#   strip            drop all thinking + redacted_thinking blocks
+#   off              pass history through untouched (legacy/debug)
+THINKING_HISTORY = os.environ.get("THINKING_HISTORY", "ensure").strip().lower()
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -344,11 +380,95 @@ def _models() -> list[str]:
 
 _SKIP = {"stream"}                     # handled separately
 _STRIP = {"thinking", "output_config"}  # non-standard; trigger agentrouter content filter
+_THINKING_BLOCK_TYPES = {"thinking", "redacted_thinking"}
+
+
+def _normalize_thinking_blocks(messages, mode: str) -> tuple[list, int, int]:
+    """Make request history satisfy AgentRouter's thinking-mode schema.
+
+    Rules (verified empirically, see README "Thinking history"):
+
+    - ``redacted_thinking`` is not a recognised content-block variant
+      upstream, so it is always dropped (deserialization would 400).
+    - In thinking mode, every assistant message containing a ``tool_use``
+      block must also carry a ``thinking`` block, or upstream returns
+      "The `content[].thinking` in the thinking mode must be passed back to
+      the API." A minimal ``{"type": "thinking", "thinking": ""}`` is enough;
+      the ``signature`` field is optional.
+    - Plain text-only assistant turns do not need a thinking block.
+
+    Modes:
+        ``ensure`` (default) inject where missing, keep existing thinking
+        ``strip``  drop all thinking blocks
+        ``off``    leave history untouched
+
+    Returns ``(messages, injected, dropped)``. Non-list content (strings,
+    ``None``) and non-dict blocks are passed through untouched.
+    """
+    if mode == "off" or not isinstance(messages, list):
+        return messages, 0, 0
+
+    out: list = []
+    injected = 0
+    dropped = 0
+
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+
+        content = msg.get("content")
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+
+        had_tool_use = False
+        had_thinking = False
+        new_content: list = []
+
+        for block in content:
+            if isinstance(block, dict) and block.get("type") in _THINKING_BLOCK_TYPES:
+                if block.get("type") == "redacted_thinking" or mode == "strip":
+                    dropped += 1
+                    continue
+                # Upstream requires the `thinking` field to be present (an
+                # empty string is accepted), so normalise a missing one.
+                if not isinstance(block.get("thinking"), str):
+                    block = {**block, "thinking": ""}
+                had_thinking = True
+                new_content.append(block)
+                continue
+
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                had_tool_use = True
+            new_content.append(block)
+
+        if mode == "ensure" and had_tool_use and not had_thinking:
+            new_content.insert(0, {"type": "thinking", "thinking": ""})
+            injected += 1
+
+        # Drop a message that had content but no longer has any blocks.
+        if not new_content and content:
+            continue
+
+        new_msg = dict(msg)
+        new_msg["content"] = new_content
+        out.append(new_msg)
+
+    return out, injected, dropped
 
 
 def _kwargs(body: dict) -> dict:
     """Forward all fields except stream (handled separately) and non-standard extras."""
-    return {k: v for k, v in body.items() if k not in _SKIP and k not in _STRIP}
+    kw = {k: v for k, v in body.items() if k not in _SKIP and k not in _STRIP}
+    msgs, injected, dropped = _normalize_thinking_blocks(kw.get("messages"), THINKING_HISTORY)
+    if injected or dropped:
+        kw["messages"] = msgs
+        log.info(
+            "thinking-history mode=%s injected=%d dropped=%d",
+            THINKING_HISTORY, injected, dropped,
+        )
+    return kw
 
 
 def _exc_chain(exc: BaseException) -> str:

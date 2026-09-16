@@ -167,6 +167,7 @@ This is the exact architecture of `proxy.py` in this repo.
 | WAF also blocks `httpx.AsyncClient` and raw `httpx.Client` | Must use `anthropic.Anthropic` (sync), not `AsyncAnthropic` or bare httpx |
 | AgentRouter injects `billing_summary` SSE events | Proxy filters them — OpenCode's Zod parser rejects unknown event types |
 | OpenCode sends `thinking: {type: adaptive}` and `output_config` fields | Proxy strips these — AgentRouter's content filter blocks requests containing them |
+| AgentRouter requires a `thinking` block on assistant `tool_use` turns, and rejects `redacted_thinking` outright; `@ai-sdk/anthropic` drops unsigned reasoning, leaving some tool-use turns without thinking → ``The `content[].thinking` in the thinking mode must be passed back to the API`` | Proxy drops `redacted_thinking` and injects an empty `thinking` block into tool-use turns that lack one (see [Thinking history](#thinking-history)) |
 | OpenCode AI SDK calls `/messages` (no `/v1` prefix) | Proxy mounts on both `/messages` and `/v1/messages` |
 | `GET /v1/models` (LLM path) is WAF-blocked | Proxy fetches the list from the dashboard API (`/api/user/models`) using your `set-cookie` credentials, cached for 5 min |
 
@@ -236,6 +237,20 @@ Add this to `~/.config/opencode/opencode.json`:
 export ANTHROPIC_BASE_URL=http://localhost:7187
 export ANTHROPIC_API_KEY=sk-YOUR_KEY_HERE
 ```
+
+#### Keeping the OpenCode TUI model picker in sync
+
+The TUI reads its model list from the static `models` map in `opencode.json` — it never
+queries the proxy's `/v1/models`. After initial setup (and whenever AgentRouter adds or
+retires models), refresh it with:
+
+```bash
+agentrouter-proxy sync-models          # rewrites the models block, backs up to opencode.json.bak
+agentrouter-proxy sync-models --dry-run  # preview only, changes nothing
+```
+
+Then restart the OpenCode TUI. The proxy's `/v1/models` stays live on its own (dashboard
+API fetch, 5-min TTL cache, stub fallback) for clients that do query it.
 
 #### Cursor / any OpenAI-compatible client
 
@@ -308,6 +323,49 @@ curl -s http://localhost:7187/messages \
 
 A successful response means the WAF check passed and the model has capacity.
 
+## Thinking history
+
+AgentRouter runs reasoning models (e.g. `deepseek-v4-flash`) in **thinking
+mode**. In that mode it requires every assistant message containing a
+`tool_use` block to also carry a `thinking` block; otherwise it returns:
+
+```
+The `content[].thinking` in the thinking mode must be passed back to the API.
+```
+
+Vercel's `@ai-sdk/anthropic` (used by OpenCode) silently drops reasoning
+parts that lack a provider `signature`, so assistant tool-use turns whose
+reasoning was unsigned arrive with no `thinking` block and trip that check.
+AgentRouter also cannot deserialize `redacted_thinking` at all (it is not a
+recognised content-block variant), which produces a separate schema error.
+
+The proxy therefore normalizes the outbound history. Control it with
+`THINKING_HISTORY`:
+
+| Value | Behavior |
+|---|---|
+| `ensure` *(default)* | Drop `redacted_thinking` and inject a minimal empty `thinking` block into any assistant `tool_use` turn that lacks one; keep existing thinking blocks |
+| `strip` | Drop all `thinking` + `redacted_thinking` blocks (for upstreams that reject them) |
+| `off` | Pass history through untouched (legacy/debug) |
+
+Notes:
+
+- The injected block is `{"type": "thinking", "thinking": ""}`. Verified
+  against upstream: the `thinking` field is required (an empty string is
+  accepted) and `signature` is optional.
+- Text-only assistant turns do **not** need a thinking block; only turns
+  containing `tool_use` do.
+- This is request-side only — streamed reasoning still reaches the client and
+  renders normally in the TUI.
+- It cannot restore reasoning the client already dropped; it only satisfies
+  upstream's structural requirement.
+
+Example:
+
+```bash
+THINKING_HISTORY=strip bash start.sh
+```
+
 ## Troubleshooting
 
 | Error | Cause | Fix |
@@ -315,5 +373,7 @@ A successful response means the WAF check passed and the model has capacity.
 | `unauthorized client detected` | WAF blocked — not using proxy | Ensure your client points to `http://localhost:7187`, not agentrouter.org directly |
 | `503 no available channel` | Model pool exhausted on agentrouter.org | Try another model or wait and retry |
 | `content-blocked` | Non-standard request fields | Proxy strips `thinking` and `output_config` already; if it persists, report an issue |
+| ``The `content[].thinking` in the thinking mode must be passed back to the API`` | A `tool_use` turn without a `thinking` block (see [Thinking history](#thinking-history)) | Proxy injects a minimal thinking block by default (`THINKING_HISTORY=ensure`) |
+| `unknown variant 'redacted_thinking'` | Upstream can't deserialize redacted thinking | Proxy drops `redacted_thinking` by default |
 | `Not Found` from proxy | Wrong path | Proxy handles `/messages` and `/v1/messages` — ensure `baseURL` has no path suffix |
 | Port 7187 already in use | Old proxy still running | `lsof -ti :7187 \| xargs kill -9` |
