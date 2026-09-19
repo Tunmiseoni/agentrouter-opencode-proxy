@@ -20,7 +20,7 @@ that re-issues requests using that SDK so OpenCode's Node.js AI SDK can use Agen
 
 ## Step 2 — Clone the proxy repo
 ```bash
-git clone https://github.com/Goodnessmbakara/agentrouter-opencode-proxy ~/.config/opencode/agentrouter-proxy
+git clone https://github.com/Tunmiseoni/agentrouter-opencode-proxy ~/.config/opencode/agentrouter-proxy
 ```
 If the directory already exists, run `git -C ~/.config/opencode/agentrouter-proxy pull` instead.
 

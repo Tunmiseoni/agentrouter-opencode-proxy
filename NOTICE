@@ -1,0 +1,13 @@
+agentrouter-opencode-proxy
+Copyright (c) 2026 Tunmiseoni and contributors
+
+This project is a derivative of the original work by Goodness Mbakara:
+
+    agentrouter-opencode-proxy
+    https://github.com/Goodnessmbakara/agentrouter-opencode-proxy
+
+The original proxy, README, and research trail were authored by Goodness
+Mbakara. This fork/repository adds the sk--only key pool, the menu-bar tray,
+the agentrouter-proxy CLI wrapper, live model-list fetching, and the
+thinking-mode history normalization. Please credit and support the upstream
+project where appropriate.

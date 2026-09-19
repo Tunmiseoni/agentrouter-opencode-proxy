@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/Tunmiseoni/agentrouter-opencode-proxy/security/advisories/new
+    about: Report credential-exposing or security issues privately.
+  - name: Upstream service issues
+    url: https://agentrouter.org
+    about: WAF blocks, model availability, or billing problems are upstream, not this proxy.

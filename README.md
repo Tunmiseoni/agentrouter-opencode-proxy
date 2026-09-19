@@ -8,6 +8,8 @@ Sign up with this referral link and you get **$150 in free credits** to use on a
 
 **👉 https://agentrouter.org/register?aff=pP0u**
 
+*This is a referral link — I receive a small bonus if you sign up through it, at no extra cost to you.*
+
 ---
 
 ## Quickest setup: use the agent prompt
@@ -186,7 +188,7 @@ Prefer to do it yourself? Follow these steps.
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/Goodnessmbakara/agentrouter-opencode-proxy
+git clone https://github.com/Tunmiseoni/agentrouter-opencode-proxy
 cd agentrouter-opencode-proxy
 ```
 
@@ -432,3 +434,17 @@ THINKING_HISTORY=strip bash start.sh
 | `unknown variant 'redacted_thinking'` | Upstream can't deserialize redacted thinking | Proxy drops `redacted_thinking` by default |
 | `Not Found` from proxy | Wrong path | Proxy handles `/messages` and `/v1/messages` — ensure `baseURL` has no path suffix |
 | Port 7187 already in use | Old proxy still running | `lsof -ti :7187 \| xargs kill -9` |
+
+## Credits
+
+The original proxy, setup guide, and research trail were created by
+**[Goodness Mbakara](https://github.com/Goodnessmbakara)** in
+[`Goodnessmbakara/agentrouter-opencode-proxy`](https://github.com/Goodnessmbakara/agentrouter-opencode-proxy).
+This repository is a derivative that adds the `sk-`-only key pool, the
+menu-bar tray, the `agentrouter-proxy` CLI wrapper, live model-list fetching,
+and thinking-mode history normalization. See [`NOTICE`](./NOTICE).
+
+## License
+
+[MIT](./LICENSE)
+
