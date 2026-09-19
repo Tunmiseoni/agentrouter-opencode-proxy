@@ -30,6 +30,28 @@ struct QuotaInfo {
     var timestamp: String = ""
 }
 
+struct PoolKeyInfo {
+    var name: String = ""
+    var remaining: Double? = nil
+    var spent: Double? = nil
+    var enabled: Bool = true
+    var dead: Bool = false
+    var unanchored: Bool = false
+    var usageUnknown: Bool = false
+    var recalibrated: String? = nil
+}
+
+struct PoolInfo {
+    var routingEnabled: Bool = false
+    var configured: Int = 0
+    var totalRemaining: Double = 0
+    var usageUnknownCount: Int = 0
+    var keys: [PoolKeyInfo] = []
+    var valid: Bool = false
+
+    var hasKeys: Bool { !keys.isEmpty }
+}
+
 func fetchQuota() -> QuotaInfo {
     var info = QuotaInfo()
     let (out, ok) = runProxy(["quota", "--raw"])
@@ -71,11 +93,67 @@ func fetchQuota() -> QuotaInfo {
     return info
 }
 
+func jsonBool(_ v: Any?) -> Bool? {
+    if let b = v as? Bool { return b }
+    if let n = v as? NSNumber { return n.boolValue }
+    return nil
+}
+
+func fetchPool() -> PoolInfo {
+    var info = PoolInfo()
+    let (out, ok) = runProxy(["pool-status", "--raw"])
+    guard ok else { return info }
+    // pool-status --raw emits a single JSON object; skip any shell warm-up lines.
+    guard let start = out.firstIndex(of: "{"),
+          let data = String(out[start...]).data(using: .utf8),
+          let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let perKey = root["per_key"] as? [String: Any] else {
+        return info
+    }
+    info.routingEnabled = jsonBool(root["enabled"]) ?? false
+    info.configured = (root["configured"] as? NSNumber)?.intValue ?? perKey.count
+    info.totalRemaining = (root["total_remaining"] as? NSNumber)?.doubleValue ?? 0
+    info.usageUnknownCount = (root["usage_unknown_count"] as? NSNumber)?.intValue ?? 0
+
+    for name in perKey.keys.sorted() {
+        guard let rec = perKey[name] as? [String: Any] else { continue }
+        var k = PoolKeyInfo()
+        k.name = name
+        k.remaining = (rec["remaining"] as? NSNumber)?.doubleValue
+        k.spent = (rec["spent"] as? NSNumber)?.doubleValue
+        k.enabled = jsonBool(rec["enabled"]) ?? true
+        k.dead = jsonBool(rec["dead"]) ?? false
+        k.unanchored = jsonBool(rec["unanchored"]) ?? false
+        k.usageUnknown = jsonBool(rec["usage_unknown"]) ?? false
+        k.recalibrated = rec["recalibrated"] as? String
+        info.keys.append(k)
+    }
+    info.valid = true
+    return info
+}
+
+func keyStateLabel(_ k: PoolKeyInfo) -> String {
+    if k.dead { return "DEAD" }
+    if !k.enabled { return "disabled" }
+    if k.unanchored { return "unanchored" }
+    if k.usageUnknown { return "usage unknown" }
+    return ""
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var menu = NSMenu()
     var timer: Timer?
     var currentInfo = QuotaInfo()
+    var currentPool = PoolInfo()
+
+    // Named items so updates never depend on fixed indices.
+    var remainingItem: NSMenuItem!
+    var usedItem: NSMenuItem!
+    var requestsItem: NSMenuItem!
+    var updatedItem: NSMenuItem!
+    var poolSubmenu: NSMenu!
+    var poolHeaderItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -83,10 +161,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem(title: "AgentRouter Proxy", action: nil, keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Remaining: loading…", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Used: —", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Requests: —", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "Updated: —", action: nil, keyEquivalent: ""))
+
+        // Own account (cookie-based), unchanged.
+        remainingItem = NSMenuItem(title: "Account: loading…", action: nil, keyEquivalent: "")
+        usedItem = NSMenuItem(title: "Used: —", action: nil, keyEquivalent: "")
+        requestsItem = NSMenuItem(title: "Requests: —", action: nil, keyEquivalent: "")
+        updatedItem = NSMenuItem(title: "Updated: —", action: nil, keyEquivalent: "")
+        menu.addItem(remainingItem)
+        menu.addItem(usedItem)
+        menu.addItem(requestsItem)
+        menu.addItem(updatedItem)
+
+        // Pool submenu, hidden until keys configure themselves.
+        poolHeaderItem = NSMenuItem(title: "Pool", action: nil, keyEquivalent: "")
+        poolSubmenu = NSMenu()
+        menu.addItem(poolHeaderItem)
+        poolHeaderItem.submenu = poolSubmenu
+        poolHeaderItem.isHidden = true
+
         menu.addItem(NSMenuItem.separator())
 
         let refresh = NSMenuItem(title: "Refresh now", action: #selector(refreshNow), keyEquivalent: "r")
@@ -114,25 +206,71 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    func updateOwnAccount(_ info: QuotaInfo) {
+        if info.valid {
+            let pctStr = String(format: "%.1f%%", info.pct)
+            remainingItem.title = "Account: \(pctStr) ($\(String(format: "%.2f", info.dollars)))"
+            usedItem.title = "Used: $\(String(format: "%.2f", info.usedDollars))"
+            requestsItem.title = "Requests: \(info.requests)"
+            updatedItem.title = "Updated: \(info.timestamp)"
+        } else {
+            remainingItem.title = "Account: unavailable (cookie expired?)"
+            usedItem.title = "Used: —"
+            requestsItem.title = "Requests: —"
+            updatedItem.title = "Updated: —"
+        }
+    }
+
+    func updatePoolMenu(_ pool: PoolInfo) {
+        poolSubmenu.removeAllItems()
+        guard pool.valid, pool.hasKeys else {
+            poolHeaderItem.isHidden = true
+            return
+        }
+        poolHeaderItem.isHidden = false
+
+        let routing = pool.routingEnabled ? "Routing: on" : "Routing: OFF — set POOL_ENABLED=1"
+        poolSubmenu.addItem(NSMenuItem(title: routing, action: nil, keyEquivalent: ""))
+        poolSubmenu.addItem(NSMenuItem(
+            title: "Combined: $\(String(format: "%.2f", pool.totalRemaining)) (\(pool.keys.count) key(s))",
+            action: nil, keyEquivalent: ""))
+        if pool.usageUnknownCount > 0 {
+            poolSubmenu.addItem(NSMenuItem(
+                title: "\(pool.usageUnknownCount) key(s) with unknown usage",
+                action: nil, keyEquivalent: ""))
+        }
+        poolSubmenu.addItem(NSMenuItem.separator())
+
+        for k in pool.keys {
+            var title = k.name
+            if let r = k.remaining {
+                title += String(format: "  $%.2f", r)
+            } else {
+                title += "  $?"
+            }
+            if let s = k.spent, s > 0 {
+                title += String(format: "  (spent $%.2f)", s)
+            }
+            let state = keyStateLabel(k)
+            if !state.isEmpty { title += "  [\(state)]" }
+            poolSubmenu.addItem(NSMenuItem(title: title, action: nil, keyEquivalent: ""))
+        }
+    }
+
     @objc func refreshNow(_ sender: Any?) {
         currentInfo = fetchQuota()
-        if currentInfo.valid {
-            let pctStr = String(format: "%.1f%%", currentInfo.pct)
-            statusItem.button?.title = "AR \(pctStr)"
-            if let items = menu.items as? [NSMenuItem] {
-                items[2].title = "Remaining: \(pctStr) ($\(String(format: "%.2f", currentInfo.dollars)))"
-                items[3].title = "Used: $\(String(format: "%.2f", currentInfo.usedDollars))"
-                items[4].title = "Requests: \(currentInfo.requests)"
-                items[5].title = "Updated: \(currentInfo.timestamp)"
-            }
+        currentPool = fetchPool()
+        updateOwnAccount(currentInfo)
+        updatePoolMenu(currentPool)
+
+        if currentPool.valid && currentPool.hasKeys {
+            let dollars = String(format: "%.2f", currentPool.totalRemaining)
+            let warn = (!currentPool.routingEnabled || currentPool.usageUnknownCount > 0) ? " !" : ""
+            statusItem.button?.title = "AR $\(dollars)\(warn)"
+        } else if currentInfo.valid {
+            statusItem.button?.title = String(format: "AR %.1f%%", currentInfo.pct)
         } else {
             statusItem.button?.title = "AR \u{26A0}\u{FE0F}"
-            if let items = menu.items as? [NSMenuItem] {
-                items[2].title = "Remaining: unavailable (cookie expired?)"
-                items[3].title = "Used: —"
-                items[4].title = "Requests: —"
-                items[5].title = "Updated: —"
-            }
         }
     }
 

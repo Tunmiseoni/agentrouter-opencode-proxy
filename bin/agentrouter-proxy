@@ -13,6 +13,13 @@ KEY_DIR="$HOME/.config/opencode/api_keys"
 QUOTA_USER_ID_FILE="$KEY_DIR/AGENT_ROUTER_USER_ID"
 QUOTA_COOKIE_FILE="$KEY_DIR/AGENT_ROUTER_COOKIE"
 
+POOL_FILE="$KEY_DIR/pool.json"
+POOL_STATE_FILE="$KEY_DIR/pool-state.json"
+POOL_KEY_PREFIX="AGENTROUTER_FRIEND_"
+POOL_TARGET="${AGENTROUTER_TARGET:-https://agentrouter.org}"
+PROXY_URL="${AGENTROUTER_PROXY_URL:-http://localhost:7187}"
+VENV_PY="$PROXY_DIR/.venv/bin/python"
+
 TRAY_INTERVAL="${AGENTROUTER_TRAY_INTERVAL:-120}"
 
 is_running() {
@@ -200,6 +207,424 @@ set_cookie() {
     fi
 }
 
+fetch_models() {
+    # Print live AgentRouter model ids, one per line.
+    # Tries the dashboard API first (same credentials as quota),
+    # falls back to the running local proxy (TTL cache + stub fallback).
+    local user_id="" cookie=""
+    if [[ -f "$QUOTA_USER_ID_FILE" ]]; then
+        user_id=$(cat "$QUOTA_USER_ID_FILE" 2>/dev/null | tr -d '\n')
+    fi
+    if [[ -f "$QUOTA_COOKIE_FILE" ]]; then
+        cookie=$(cat "$QUOTA_COOKIE_FILE" 2>/dev/null | tr -d '\n')
+    fi
+
+    if [[ -n "$user_id" && -n "$cookie" ]]; then
+        local resp names
+        resp=$(curl -s --max-time 30 \
+            'https://agentrouter.org/api/user/models' \
+            -H "New-API-User: $user_id" \
+            -b "$cookie" \
+            -H 'Accept: application/json' 2>/dev/null)
+        names=$(echo "$resp" | jq -r '.data[]? | select(type=="string")' 2>/dev/null)
+        if [[ -n "$names" ]]; then
+            echo "$names"
+            return 0
+        fi
+    fi
+
+    local proxied
+    proxied=$(curl -s --max-time 15 'http://localhost:7187/v1/models' 2>/dev/null \
+        | jq -r '.data[]?.id' 2>/dev/null)
+    if [[ -n "$proxied" ]]; then
+        echo "$proxied"
+        return 0
+    fi
+
+    return 1
+}
+
+sync_models() {
+    # Rewrite the `models` block of every opencode.json provider that
+    # points at this proxy, so the TUI picker matches the live upstream
+    # list. The TUI reads models from config — it never queries /v1/models.
+    local dry_run=false config="$HOME/.config/opencode/opencode.json"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -n|--dry-run) dry_run=true; shift ;;
+            -c|--config) config="$2"; shift 2 ;;
+            *) echo "Unknown option: $1"
+               echo "Usage: agentrouter-proxy sync-models [-n|--dry-run] [-c|--config PATH]"
+               return 1 ;;
+        esac
+    done
+
+    if [[ ! -f "$config" ]]; then
+        echo "Config not found: $config"
+        return 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "jq is required for sync-models."
+        return 1
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "python3 is required for sync-models."
+        return 1
+    fi
+
+    echo "Fetching live model list..."
+    local names
+    names=$(fetch_models) || {
+        echo "Failed to fetch model list from dashboard and local proxy."
+        echo "  agentrouter-proxy set-cookie   # refresh dashboard credentials"
+        return 1
+    }
+
+    local count
+    count=$(echo "$names" | grep -c .)
+    echo "Live models ($count): $(echo "$names" | tr '\n' ' ')"
+
+    if $dry_run; then
+        echo "Dry run — $config unchanged."
+        return 0
+    fi
+
+    cp "$config" "$config.bak" || { echo "Backup failed; aborting."; return 1; }
+
+    echo "$names" | python3 -c '
+import json, sys
+config_path = sys.argv[1]
+names = [l.strip() for l in sys.stdin if l.strip()]
+with open(config_path) as f:
+    cfg = json.load(f)
+providers = cfg.get("provider", {})
+touched = []
+for key, prov in providers.items():
+    base = ((prov.get("options") or {}).get("baseURL") or "")
+    if "7187" not in base and "localhost" not in base:
+        continue
+    old = prov.get("models") or {}
+    new_models = {}
+    for mid in names:
+        if mid in old and isinstance(old[mid], dict) and old[mid].get("name"):
+            new_models[mid] = {"name": old[mid]["name"]}
+        else:
+            new_models[mid] = {"name": mid}
+    added = [m for m in new_models if m not in old]
+    removed = [m for m in old if m not in new_models]
+    prov["models"] = new_models
+    touched.append((key, added, removed))
+if not touched:
+    print("No provider pointing at the local proxy found; config unchanged.")
+    sys.exit(2)
+with open(config_path, "w") as f:
+    json.dump(cfg, f, indent=2)
+    f.write("\n")
+for key, added, removed in touched:
+    print(f"provider {key}: added={added} removed={removed}")
+' "$config" || { echo "Update failed; backup at $config.bak"; return 1; }
+
+    echo "Updated $config (backup: $config.bak). Restart the OpenCode TUI to pick up the new list."
+}
+
+# ── Key pool ──────────────────────────────────────────────────────────────────
+#
+# CLI side of the sk--only pool. Key material is read from stdin only (never
+# argv), written 600, and never echoed. pool.json is CLI-owned (enabled +
+# balance anchors); the proxy owns pool-state.json (dead marks). See
+# docs/pool-operations.md.
+
+ensure_pool_file() {
+    if [[ ! -f "$POOL_FILE" ]]; then
+        mkdir -p "$KEY_DIR"
+        echo '{}' > "$POOL_FILE"
+        chmod 600 "$POOL_FILE"
+    fi
+}
+
+_pool_valid_name() {
+    # Reject empty / traversal / unexpected characters before any path use.
+    local name="$1"
+    [[ -n "$name" && "$name" != *[!A-Za-z0-9._-]* ]]
+}
+
+_pool_check_mode() {
+    local file="$1" mode
+    mode=$(stat -f '%Lp' "$file" 2>/dev/null)
+    if [[ -n "$mode" && "$mode" != "600" ]]; then
+        echo "Tightening permissions on $(basename "$file") ($mode -> 600)."
+        chmod 600 "$file"
+    fi
+}
+
+_pool_key_material() {
+    # Print a key's sk- material to stdout. Never logged.
+    local name="$1" file
+    if [[ "$name" == "you" ]]; then
+        file="${AGENTROUTER_API_KEY_FILE:-$KEY_DIR/AGENT_ROUTER_API_KEY}"
+        if [[ -f "$file" ]]; then
+            tr -d '[:space:]' < "$file"
+        else
+            printf '%s' "${AGENTROUTER_API_KEY:-}"
+        fi
+        return 0
+    fi
+    file="$KEY_DIR/${POOL_KEY_PREFIX}${name}"
+    [[ -f "$file" ]] || return 1
+    tr -d '[:space:]' < "$file"
+}
+
+_pool_usage_cents() {
+    # Read the key from stdin (never argv) and print the account-cumulative
+    # spend in cents. Same endpoint the proxy uses.
+    "$VENV_PY" -c '
+import sys
+from datetime import datetime, timezone
+import httpx
+
+key = sys.stdin.read().strip()
+target = sys.argv[1]
+today = datetime.now(timezone.utc).date().isoformat()
+resp = httpx.get(
+    f"{target}/v1/dashboard/billing/usage",
+    params={"start_date": "1970-01-01", "end_date": today},
+    headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+    timeout=30.0,
+)
+resp.raise_for_status()
+print(resp.json()["total_usage"])
+' "$POOL_TARGET"
+}
+
+pool_add() {
+    local name="$1"
+    if [[ -z "$name" || "$name" == -* ]]; then
+        echo "Usage: agentrouter-proxy pool-add <name>"
+        echo ""
+        echo "Reads the sk- key from stdin (never argv). Interactive:"
+        echo "  agentrouter-proxy pool-add friend-a   # then paste the key"
+        echo "Piped:"
+        echo "  pool-add friend-a < /secure/one-time-share"
+        echo ""
+        echo "Afterwards: agentrouter-proxy pool-recalibrate $name <remaining_usd>"
+        return 1
+    fi
+
+    command -v jq >/dev/null 2>&1 || { echo "jq is required for the pool commands."; return 1; }
+
+    local file="$KEY_DIR/${POOL_KEY_PREFIX}${name}"
+    case "$name" in
+        you)
+            echo "'you' resolves to your existing AGENT_ROUTER_API_KEY; don't pool-add it."
+            echo "Use: agentrouter-proxy pool-recalibrate you <remaining_usd>"
+            return 1
+            ;;
+        *[!A-Za-z0-9._-]*|"")
+            echo "Key name may only contain letters, digits, dot, underscore, dash."
+            return 1
+            ;;
+    esac
+    if [[ -f "$file" ]]; then
+        echo "A key named '$name' already exists ($file)."
+        echo "Run 'agentrouter-proxy pool-forget $name' first to replace it."
+        return 1
+    fi
+
+    local key
+    if [[ -t 0 ]]; then
+        echo "Paste the sk- key for '$name' (hidden), then press Enter:"
+        read -rs key
+        echo ""
+    else
+        read -r key
+    fi
+    key=$(printf '%s' "$key" | tr -d '[:space:]')
+    if [[ -z "$key" ]]; then
+        echo "No key provided; nothing written."
+        return 1
+    fi
+    if [[ "$key" != sk-* ]]; then
+        echo "Warning: key does not start with 'sk-'." >&2
+    fi
+
+    mkdir -p "$KEY_DIR"
+    ( umask 077; print -r -- "$key" > "$file" )
+    chmod 600 "$file"
+
+    ensure_pool_file
+    local tmp="${POOL_FILE}.tmp.$$"
+    if jq --arg name "$name" \
+          '.[$name] = {enabled: true, anchor_remaining_usd: null, anchor_usage_cents: null, recalibrated: null}' \
+          "$POOL_FILE" > "$tmp"; then
+        chmod 600 "$tmp" && mv "$tmp" "$POOL_FILE"
+    else
+        rm -f "$tmp"
+        echo "Failed to update $POOL_FILE; removing key file."
+        rm -f "$file"
+        return 1
+    fi
+
+    echo "Added '$name' ($file, mode 600)."
+    echo "It is excluded from routing until calibrated (routing auto-enables then):"
+    echo "  agentrouter-proxy pool-recalibrate $name <remaining_usd>"
+}
+
+pool_forget() {
+    local name="$1"
+    [[ -n "$name" ]] || { echo "Usage: agentrouter-proxy pool-forget <name>"; return 1; }
+    _pool_valid_name "$name" || { echo "Invalid key name: $name"; return 1; }
+    command -v jq >/dev/null 2>&1 || { echo "jq is required for the pool commands."; return 1; }
+
+    local file="$KEY_DIR/${POOL_KEY_PREFIX}${name}" removed=false
+    if [[ -f "$file" ]]; then
+        rm -f "$file"
+        removed=true
+        echo "Removed key file: $file"
+    else
+        echo "No key file for '$name'."
+    fi
+
+    if [[ -f "$POOL_FILE" ]]; then
+        local tmp="${POOL_FILE}.tmp.$$"
+        if jq --arg name "$name" \
+              'if has($name) then .[$name].enabled = false else . end' \
+              "$POOL_FILE" > "$tmp"; then
+            chmod 600 "$tmp" && mv "$tmp" "$POOL_FILE"
+            echo "pool.json: '$name' enabled=false."
+        else
+            rm -f "$tmp"
+            echo "Failed to update $POOL_FILE." >&2
+        fi
+    fi
+
+    echo "The proxy drops the cached client on the next config reload."
+}
+
+pool_recalibrate() {
+    local name="$1" amount="$2"
+    if [[ -z "$name" || -z "$amount" ]]; then
+        echo "Usage: agentrouter-proxy pool-recalibrate <name> <remaining_usd>"
+        echo "  e.g. agentrouter-proxy pool-recalibrate friend-a 30.00"
+        return 1
+    fi
+    command -v jq >/dev/null 2>&1 || { echo "jq is required for the pool commands."; return 1; }
+    _pool_valid_name "$name" || { echo "Invalid key name: $name"; return 1; }
+    if [[ "$amount" != <-> && "$amount" != <->.<-> ]]; then
+        echo "Not a number: $amount"
+        return 1
+    fi
+
+    local file keyfile
+    if [[ "$name" == "you" ]]; then
+        keyfile="${AGENTROUTER_API_KEY_FILE:-$KEY_DIR/AGENT_ROUTER_API_KEY}"
+    else
+        keyfile="$KEY_DIR/${POOL_KEY_PREFIX}${name}"
+    fi
+    local key
+    key=$(_pool_key_material "$name") || {
+        echo "No key material for '$name'."
+        echo "  (run: agentrouter-proxy pool-add $name)"
+        return 1
+    }
+    [[ -n "$key" ]] || { echo "No key material for '$name'."; return 1; }
+    [[ -f "$keyfile" ]] && _pool_check_mode "$keyfile"
+
+    echo "Reading live usage for '$name'..."
+    local cents
+    cents=$(printf '%s' "$key" | _pool_usage_cents) || {
+        echo "Failed to read usage from $POOL_TARGET. Nothing written."
+        return 1
+    }
+
+    ensure_pool_file
+    local today tmp
+    today=$(date -u +%Y-%m-%d)
+    tmp="${POOL_FILE}.tmp.$$"
+    if jq --arg name "$name" --argjson amount "$amount" --argjson cents "$cents" --arg date "$today" \
+          '.[$name] = ((.[$name] // {}) + {enabled: true, anchor_remaining_usd: $amount, anchor_usage_cents: $cents, recalibrated: $date})' \
+          "$POOL_FILE" > "$tmp"; then
+        chmod 600 "$tmp" && mv "$tmp" "$POOL_FILE"
+    else
+        rm -f "$tmp"
+        echo "Failed to update $POOL_FILE." >&2
+        return 1
+    fi
+
+    echo "Anchored '$name': remaining \$$amount at ${cents}c usage on $today."
+    echo "Any dead mark older than $today is now cleared."
+}
+
+_print_pool_status() {
+    echo "$1" | jq -r '
+      "Pool: \(.per_key | length) key(s), $" +
+      (((.total_remaining // 0) * 100 | round) / 100 | tostring) + " remaining" +
+      (if .enabled then "" else "  (routing OFF)" end) +
+      (if (.usage_unknown_count // 0) > 0 then "  (\(.usage_unknown_count) usage unknown)" else "" end),
+      (.per_key | to_entries[] |
+        "  " + .key + "  " +
+        (if .value.unanchored then "unanchored (run pool-recalibrate)"
+         elif .value.usage_unknown then "usage unknown (not scored)"
+         else "remaining $" + ((((.value.remaining // 0) * 100 | round) / 100) | tostring) +
+              "  spent $" + ((((.value.spent // 0) * 100 | round) / 100) | tostring)
+         end) +
+        (if .value.dead then "  DEAD" elif (.value.enabled | not) then "  disabled" else "" end)
+      ),
+      (if ([.per_key[] | select(.virtual == true and .usage_unknown == true)] | length) > 0
+       then "  note: own balance unavailable (/api/user/self is captcha-gated); include it with: agentrouter-proxy pool-recalibrate you <remaining>"
+       else empty end)
+    '
+}
+
+pool_summary() {
+    # Compact pool block for status/start; silent when no pool.json.
+    [[ -f "$POOL_FILE" ]] || return 0
+    echo ""
+    pool_status_cmd || true
+}
+
+_pool_status_from_proxy() {
+    # Authoritative when the running proxy has pooling on.
+    local resp has
+    resp=$(curl -s --max-time 5 "$PROXY_URL/pool/status" 2>/dev/null)
+    has=$(echo "$resp" | jq -r 'if (.per_key | type) == "object" and (.per_key | length) > 0 then "yes" else "no" end' 2>/dev/null)
+    [[ "$has" == "yes" ]] && { echo "$resp"; return 0; }
+    return 1
+}
+
+_pool_status_from_files() {
+    # Works with the proxy stopped; reuses the proxy's own math. Does not force
+    # POOL_ENABLED, so the reported routing state is honest.
+    "$VENV_PY" -c '
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import proxy
+print(json.dumps(proxy._pool_status(refresh=True)))
+' "$PROXY_DIR" 2>/dev/null
+}
+
+pool_status_cmd() {
+    local raw=false
+    [[ "$1" == "--raw" ]] && raw=true
+    command -v jq >/dev/null 2>&1 || { echo "jq is required for the pool commands."; return 1; }
+
+    local json
+    json=$(_pool_status_from_proxy) || json=$(_pool_status_from_files) || {
+        echo "Could not read pool status (proxy stopped and files unreadable?)."
+        return 1
+    }
+    if [[ -z "$json" ]]; then
+        echo "No pool keys configured. Start with: agentrouter-proxy pool-add <name>"
+        return 1
+    fi
+
+    if $raw; then
+        echo "$json" | jq '.'
+    else
+        _print_pool_status "$json"
+    fi
+}
+
 start_proxy() {
     if is_running; then
         echo "AgentRouter proxy is already running (PID $(cat "$PID_FILE"))."
@@ -223,6 +648,7 @@ start_proxy() {
             echo "Log: $LOG_FILE"
             echo ""
             quota_report
+            pool_summary
             start_tray && echo "Tray icon active in menu bar."
         else
             rm -f "$PID_FILE"
@@ -234,6 +660,7 @@ start_proxy() {
         echo "Starting AgentRouter proxy..."
         echo "Press Ctrl+C to stop."
         quota_report
+        pool_summary
         start_tray && echo "Tray icon active in menu bar."
         trap 'stop_tray; echo ""; echo "Stopped."' EXIT INT TERM
         "$START_SCRIPT"
@@ -283,6 +710,7 @@ status_proxy() {
         echo "Log: $LOG_FILE"
         echo ""
         quota_report
+        pool_summary
         if tray_is_running; then
             echo "Tray icon: active (PID $(cat "$TRAY_PID_FILE"))"
         else
@@ -318,6 +746,26 @@ case "${1:-}" in
     set-cookie)
         set_cookie
         ;;
+    sync-models)
+        shift
+        sync_models "$@"
+        ;;
+    pool-add)
+        shift
+        pool_add "$@"
+        ;;
+    pool-forget)
+        shift
+        pool_forget "$@"
+        ;;
+    pool-recalibrate)
+        shift
+        pool_recalibrate "$@"
+        ;;
+    pool-status)
+        shift
+        pool_status_cmd "$@"
+        ;;
     tray-compile)
         ensure_tray_built && echo "Tray binary ready: $TRAY_BIN"
         ;;
@@ -330,6 +778,11 @@ case "${1:-}" in
         echo "  agentrouter-proxy restart [-d]    Restart the proxy"
         echo "  agentrouter-proxy quota           Show remaining quota %"
         echo "  agentrouter-proxy set-cookie      Set/refresh quota credentials"
+        echo "  agentrouter-proxy sync-models     Sync TUI model list from live upstream list"
+        echo "  agentrouter-proxy pool-add <name>            Import an sk- key (stdin-only)"
+        echo "  agentrouter-proxy pool-recalibrate <name> <usd>  Anchor a key's balance"
+        echo "  agentrouter-proxy pool-forget <name>         Delete a key and disable it"
+        echo "  agentrouter-proxy pool-status [--raw]        Show combined pool status"
         echo "  agentrouter-proxy tray-compile    Pre-compile tray app"
         exit 1
         ;;
