@@ -323,6 +323,61 @@ curl -s http://localhost:7187/messages \
 
 A successful response means the WAF check passed and the model has capacity.
 
+## Key pool (optional)
+
+The pool lets one proxy spend across several AgentRouter `sk-` keys
+(e.g. consenting friends'), least-spent-first, and fail over when one runs dry.
+**Routing auto-enables as soon as `pool.json` has one enabled, anchored key**;
+set `POOL_ENABLED=0` to force it off (kill switch) or `POOL_ENABLED=1` to force
+it on. With no pool keys configured, the proxy behaves exactly as documented
+above.
+
+- Keys are read from `~/.config/opencode/api_keys/AGENTROUTER_FRIEND_<name>`
+  (one `sk-` per file, mode `600`). `you` resolves to the existing
+  `AGENT_ROUTER_API_KEY`.
+- `pool.json` (CLI-owned) holds each key's `enabled` flag and a balance anchor.
+  Remaining is derived from the key-scoped, cookie-free
+  `GET /v1/dashboard/billing/usage` counter, not a price table:
+
+  ```
+  remaining = anchor_remaining_usd - (usage_now_cents - anchor_usage_cents) / 100
+  ```
+
+- Un-anchored keys (no `anchor_remaining_usd`) are excluded from routing until
+  calibrated. A `401` marks a key dead in `pool-state.json`; re-calibrating it
+  clears the mark.
+- **Availability:** if no key currently has a balance figure, the proxy refreshes
+  usage once and then falls back to the primary key rather than failing the
+  request. A key whose latest usage refresh failed keeps its last known value
+  (flagged `stale` in `/pool/status`), so a transient accounting hiccup cannot
+  black out the pool.
+- **Your own account** joins automatically once a friend is pooled: remaining is
+  read from your dashboard cookie and shown as the virtual `you` member.
+  `/api/user/self` is intermittently captcha-gated, so when it is unavailable
+  run `agentrouter-proxy pool-recalibrate you <remaining>` once to anchor it
+  reliably (it then tracks like any other key). This also tightens
+  `AGENT_ROUTER_API_KEY` to mode `600`.
+- `GET /pool/status` returns per-key remaining/enabled/dead/`stale` state (no secrets).
+- Knobs: `POOL_ENABLED` (unset = auto), `POOL_REFRESH_S` (default `120`),
+  `POOL_RESERVE_USD` (default `0.05`, in-flight reservation so concurrent
+  streams don't double-pick a key).
+- Manage it from the CLI:
+
+  ```bash
+  agentrouter-proxy pool-add friend-a            # paste the sk- key (stdin only)
+  agentrouter-proxy pool-recalibrate friend-a 30.00   # anchor their balance
+  agentrouter-proxy pool-recalibrate you 179.62       # include your own balance
+  agentrouter-proxy pool-status [--raw]          # combined remaining + per-key state
+  agentrouter-proxy pool-forget friend-a         # delete the key and disable it
+  ```
+
+- The menu-bar tray shows the combined pool total (`AR $200.00`), with a `!`
+  when routing is off or some usage is unknown, and a **Pool** submenu listing
+  each key. Without pool keys it keeps showing your own account percentage.
+
+Full design, operations runbook (onboarding/recalibration/revocation), and the
+discovery notes are in [`docs/`](./docs).
+
 ## Thinking history
 
 AgentRouter runs reasoning models (e.g. `deepseek-v4-flash`) in **thinking

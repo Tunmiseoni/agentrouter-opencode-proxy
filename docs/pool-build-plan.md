@@ -1,5 +1,10 @@
 # Pool build plan: `sk-`-only, least-spent-first, spend-down tracking
 
+> Superseded (accounting section) by `pool-implementation-plan.md`, which uses a
+> discovered cookie-free, key-scoped usage endpoint
+> (`GET /v1/dashboard/billing/usage`) instead of token × price estimates.
+> Storage, routing, CLI, and ops decisions below still apply.
+
 ## 0. Discovery (do first, read-only)
 1. Capture one redacted sample each (values replaced, keys kept):
    - non-streaming `msg.usage` (`msg.model_dump_json()` in `proxy.py:535`)

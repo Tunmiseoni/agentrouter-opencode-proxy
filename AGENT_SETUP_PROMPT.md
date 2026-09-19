@@ -57,6 +57,11 @@ Read the current ~/.config/opencode/opencode.json and add (or merge) this provid
 ```
 Preserve all existing config. Validate the JSON is still valid after editing.
 
+> The TUI reads its model list from this static `models` map — it never queries the
+> proxy's `/v1/models`. Whenever AgentRouter adds or retires models, refresh it with
+> `agentrouter-proxy sync-models` (preview with `--dry-run`) instead of hand-editing,
+> then restart OpenCode.
+
 ## Step 6 — Start the proxy
 ```bash
 lsof -ti :7187 | xargs kill -9 2>/dev/null || true
